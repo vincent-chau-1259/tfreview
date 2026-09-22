@@ -1,4 +1,5 @@
-docs/
+docs/*
+!docs/design.md
 *:Zone.Identifier
 
 # Build and planning notes (kept local)
