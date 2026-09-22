@@ -1,0 +1,6 @@
+docs/
+*:Zone.Identifier
+
+# Build and planning notes (kept local)
+NOTES.md
+ai-agent-project-plan.md
