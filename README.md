@@ -92,3 +92,7 @@ internal/planfix/   plan JSON builder for tests
 ```
 
 Planned: `internal/rules` and `internal/classify` (YAML rules plus Go predicates), `internal/graph` (blast radius from state and config dependencies), `internal/review` and `internal/render`.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
