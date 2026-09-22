@@ -161,7 +161,7 @@ Data sources (`mode: data`) and `no-op` changes are parsed but excluded from fin
 
 ## 5. Classification (`internal/rules`, `internal/classify`, `internal/predicates`) — implemented
 
-The rules file is YAML. A default is embedded in the binary (`internal/rules/default.yaml`), and `--rules <file>` replaces it entirely. A rules file that fails to load is a configuration error (exit 4).
+The rules file is YAML. A default is embedded in the binary (`internal/rules/default.yaml`), and `--rules <file>` replaces it entirely. There is no way yet to add rules on top of the defaults; a `--rules-extra` flag is the intended shape once copying `default.yaml` to add a rule becomes a real need. A rules file that fails to load is a configuration error (exit 4).
 
 ```yaml
 version: 1
@@ -259,7 +259,7 @@ Registry:
   - **Unknown values:** a source that is unknown until apply cannot be shown to be covered or private. An unknown CIDR counts as widening. An unknown security group is not public on create, but on update it is a new source. A whole `ingress` attribute or block that is unknown counts as all traffic from an unknown source.
   - **Normalisation:** protocol names and numbers are equated (`-1`/`all`, `6`/`tcp`, `17`/`udp`, `1`/`icmp`, `58`/`icmpv6`), CIDRs are masked, and ports are ignored for all-protocol rules.
   - **Detail:** lists each new permission, e.g. `new ingress: ingress.0: tcp port 22 from 0.0.0.0/0`.
-- **`disables_encryption`:** true when `storage_encrypted` (RDS), `encrypted` (EBS, EFS), `at_rest_encryption_enabled` or `transit_encryption_enabled` (ElastiCache) goes true to false, or when `kms_key_id`, `kms_key_arn` or `kms_master_key_id` goes from non-empty to empty, null or removed (its block deleted). A key replaced by another key does not match. `point_in_time_recovery` is not encryption. Detail names the path.
+- **`disables_encryption`:** true when `storage_encrypted` (RDS), `encrypted` (EBS, EFS), `at_rest_encryption_enabled` or `transit_encryption_enabled` (ElastiCache) goes true to false, or when `kms_key_id`, `kms_key_arn` or `kms_master_key_id` goes from non-empty to empty, null or removed (its block deleted). It also matches when a customer-managed key is replaced by an AWS-managed key (`alias/aws/rds` or any other `alias/aws/*`, as an alias name or alias ARN): a key is still set, but the resource stops using its own. That detail names only the alias, never an ARN's account or region. A key replaced by another customer-managed key, or one AWS-managed alias replaced by another, does not match. `point_in_time_recovery` is not encryption. Detail names the path.
 - **`removes_deletion_protection`:** true when `deletion_protection` or `deletion_protection_enabled` (RDS, DynamoDB) or `enable_deletion_protection` (load balancers) goes true to false, or `force_destroy` (S3, ECR and others using that convention) goes false to true. The rule is medium: this is a precursor to damage, not damage.
 - **`reduces_backup_retention`:** true when `backup_retention_period` or `snapshot_retention_limit` decreases numerically, when `skip_final_snapshot` or `delete_automated_backups` goes false to true, or when `point_in_time_recovery.N.enabled` goes true to false. A decrease to 0 is marked `(backups disabled)` in the detail. It is deliberately not a separate predicate or a separate high rule: the rule stays medium, and the detail tells the reviewer.
 - **`changes_sensitive_attribute`:** uses sensitivity markers only and never reads values. Always false for data sources, and for actions other than update and replace.
@@ -444,7 +444,7 @@ The provider is selected with `--provider`. Users are responsible for making sur
     - security groups, prefix lists and `self` as sources;
     - unknown sources and unknown `ingress`;
     - all three resource types, including egress rules being ignored.
-  - `disables_encryption`, `removes_deletion_protection` and `reduces_backup_retention` cover each listed attribute, the reverse transition (no match), nested blocks, unknown after values (no match), sensitive values (never read), and for KMS keys: removal, emptying, block deletion and key rotation (no match).
+  - `disables_encryption`, `removes_deletion_protection` and `reduces_backup_retention` cover each listed attribute, the reverse transition (no match), nested blocks, unknown after values (no match), sensitive values (never read), and for KMS keys: removal, emptying, block deletion, customer key to AWS-managed alias (name and ARN, with the detail omitting account and region), and key rotation or alias-to-alias changes (no match).
   - `changes_sensitive_attribute`: the cases and expected results are in the table below.
 - **Classification:** a mixed plan through the default rules checks highest-severity selection, that every match is recorded in order, the no-op and data-source exclusions, the pure-move exception, and that unmatched and Unknown changes are kept.
 - **Renderers:** golden-file tests for all three; `go test -update` regenerates them.

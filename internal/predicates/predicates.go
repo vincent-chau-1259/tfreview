@@ -83,7 +83,9 @@ var kmsKeys = map[string]bool{
 }
 
 // DisablesEncryption is true when an encryption flag goes true to false, or
-// a KMS key path goes from non-empty to empty, null or removed.
+// a KMS key path goes from non-empty to empty, null or removed, or from a
+// customer-managed key to an AWS-managed alias (alias/aws/*): the resource
+// stops using its own key even though a key is still set.
 func DisablesEncryption(c plan.Change) (bool, string) {
 	var found []string
 	for _, e := range c.Diff() {
@@ -97,8 +99,13 @@ func DisablesEncryption(c plan.Change) (bool, string) {
 				found = append(found, e.Path+": true -> false")
 			}
 		case kmsKeys[key]:
-			if nonEmptyBefore(c, e.Segments) && emptyAfter(c, e) {
+			if !nonEmptyBefore(c, e.Segments) {
+				continue
+			}
+			if emptyAfter(c, e) {
 				found = append(found, e.Path+" removed")
+			} else if alias, ok := awsManagedAfter(c, e.Segments); ok && !awsManagedBefore(c, e.Segments) {
+				found = append(found, e.Path+": customer-managed key replaced by AWS-managed "+alias)
 			}
 		}
 	}
@@ -218,6 +225,34 @@ func number(v any, ok bool) (float64, bool) {
 
 func fmtNum(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
+}
+
+// awsManagedAlias returns the alias/aws/... part of an AWS-managed key
+// reference, given as an alias name or an alias ARN. Only the alias is
+// returned, so an ARN's account and region never reach a detail string.
+func awsManagedAlias(v any, ok bool) (string, bool) {
+	s, isStr := v.(string)
+	if !ok || !isStr {
+		return "", false
+	}
+	if strings.HasPrefix(s, "alias/aws/") {
+		return s, true
+	}
+	if strings.HasPrefix(s, "arn:") {
+		if i := strings.Index(s, ":alias/aws/"); i >= 0 {
+			return s[i+1:], true
+		}
+	}
+	return "", false
+}
+
+func awsManagedAfter(c plan.Change, path []any) (string, bool) {
+	return awsManagedAlias(c.RawAfter(path))
+}
+
+func awsManagedBefore(c plan.Change, path []any) bool {
+	_, ok := awsManagedAlias(c.RawBefore(path))
+	return ok
 }
 
 func nonEmptyBefore(c plan.Change, path []any) bool {

@@ -193,6 +193,23 @@ func TestDisablesEncryption(t *testing.T) {
 		{"kms_master_key_id block removed", update("aws_s3_bucket_server_side_encryption_configuration",
 			m("rule", []any{m("apply_server_side_encryption_by_default", []any{m("kms_master_key_id", "k", "sse_algorithm", "aws:kms")})}),
 			m("rule", []any{})), true, []string{"kms_master_key_id removed"}},
+		{"customer key to aws-managed alias", update("aws_db_instance",
+			m("kms_key_id", "arn:aws:kms:us-east-1:111122223333:key/1234abcd"), m("kms_key_id", "alias/aws/rds")),
+			true, []string{"kms_key_id: customer-managed key replaced by AWS-managed alias/aws/rds"}},
+		{"customer key to aws-managed alias ARN", update("aws_ebs_volume",
+			m("kms_key_id", "arn:aws:kms:us-east-1:111122223333:key/1234abcd"),
+			m("kms_key_id", "arn:aws:kms:us-east-1:111122223333:alias/aws/ebs")),
+			true, []string{"AWS-managed alias/aws/ebs"}},
+		{"customer alias to aws-managed alias", update("aws_dynamodb_table",
+			m("server_side_encryption", []any{m("enabled", true, "kms_key_arn", "alias/team-key")}),
+			m("server_side_encryption", []any{m("enabled", true, "kms_key_arn", "alias/aws/dynamodb")})),
+			true, []string{"server_side_encryption.0.kms_key_arn"}},
+		{"aws-managed alias to another aws-managed alias", update("aws_db_instance",
+			m("kms_key_id", "alias/aws/rds"), m("kms_key_id", "alias/aws/ebs")), false, nil},
+		{"aws-managed alias to customer key", update("aws_db_instance",
+			m("kms_key_id", "alias/aws/rds"), m("kms_key_id", "arn:aws:kms:us-east-1:111122223333:key/1234abcd")), false, nil},
+		{"alias that only looks similar", update("aws_db_instance",
+			m("kms_key_id", "k1"), m("kms_key_id", "alias/awsome/key")), false, nil},
 		{"kms key changed to another key", update("aws_db_instance", m("kms_key_id", "k1"), m("kms_key_id", "k2")), false, nil},
 		{"kms key added", update("aws_db_instance", m("kms_key_id", ""), m("kms_key_id", "k2")), false, nil},
 		{"kms key unknown after", func(p *planfix.Plan) {
@@ -268,4 +285,14 @@ func TestReducesBackupRetention(t *testing.T) {
 			map[string]any{"backup_retention_period": 1, "skip_final_snapshot": true}),
 			true, []string{"backup_retention_period: 7 -> 1", "skip_final_snapshot: false -> true"}},
 	})
+}
+
+func TestDisablesEncryptionAliasDetailOmitsAccount(t *testing.T) {
+	c := change(t, update("aws_ebs_volume",
+		map[string]any{"kms_key_id": "arn:aws:kms:us-east-1:111122223333:key/1234abcd"},
+		map[string]any{"kms_key_id": "arn:aws:kms:us-east-1:111122223333:alias/aws/ebs"}))
+	ok, detail := DisablesEncryption(c)
+	if !ok || strings.Contains(detail, "111122223333") || strings.Contains(detail, "us-east-1") {
+		t.Errorf("matched %v, detail %q: want a match naming only the alias", ok, detail)
+	}
 }
