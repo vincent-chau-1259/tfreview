@@ -40,8 +40,9 @@ These are decisions that are easy to get wrong, with the reasoning behind each.
 cmd/tfreview/           flag parsing, subcommand dispatch, exit codes      implemented (skeleton)
 internal/plan/          plan JSON -> domain model (Change, Action, Diff)   implemented
 internal/planfix/       fixture builder (test helper, produces plan JSON)  implemented
-internal/rules/         YAML rules -> compiled matchers, predicate registry planned
-internal/classify/      Change + rules -> Severity, rule match, rationale  planned
+internal/rules/         YAML rules -> compiled matchers, predicate registry implemented
+internal/predicates/    Go predicates referenced by rules                  implemented
+internal/classify/      Change + rules -> Severity, rule match, rationale  implemented
 internal/graph/         dependency edges with provenance, blast radius     planned
 internal/review/        Review / Finding / Verdict types; assembles result planned
 internal/render/        terminal, markdown, json                           planned
@@ -158,9 +159,9 @@ Predicates may inspect sensitivity markers and which paths changed, but never re
 
 Data sources (`mode: data`) and `no-op` changes are parsed but excluded from findings by default. A `no-op` with a `PreviousAddress` (a pure move) is reported as a low-severity informational finding. A `Replace` with a `PreviousAddress` (a `moved` block that did not preserve the resource) is caught by the default `moved-then-replaced` rule in section 5.
 
-## 5. Classification (`internal/rules`, `internal/classify`) — planned
+## 5. Classification (`internal/rules`, `internal/classify`, `internal/predicates`) — implemented
 
-The rules file is YAML. A default is embedded in the binary, and `--rules <file>` overrides it.
+The rules file is YAML. A default is embedded in the binary (`internal/rules/default.yaml`), and `--rules <file>` replaces it entirely. There is no way yet to add rules on top of the defaults; a `--rules-extra` flag is the intended shape once copying `default.yaml` to add a rule becomes a real need. A rules file that fails to load is a configuration error (exit 4).
 
 ```yaml
 version: 1
@@ -203,13 +204,34 @@ rules:
       placeholder, so a replace resets the live secret to it.
 ```
 
-`when` fields (every field present must match):
-- `type_matches`: list of type names; supports `*` globs.
-- `action_in`: list of actions.
-- `address_matches`: list of address globs.
+### Default rules
+
+| id | Selects | Severity |
+|---|---|---|
+| `stateful-destroy` | stateful types (above), delete or replace | high |
+| `sg-ingress-widened` | security group types, create/update/replace, `widens_network_access` | high |
+| `encryption-disabled` | update or replace, `disables_encryption` | high |
+| `moved-then-replaced` | replace, `was_moved` | high |
+| `deletion-protection-removed` | update or replace, `removes_deletion_protection` | medium |
+| `backup-retention-reduced` | update or replace, `reduces_backup_retention` | medium |
+| `sensitive-attribute-changed` | update or replace, `changes_sensitive_attribute` | medium |
+| `removed-from-state` | forget | medium |
+| `moved` | no-op, `was_moved` (a pure move; informational) | low |
+| `new-resource` | create | low |
+
+`new-resource` is a catch-all for creates. YAML has no negation, so it cannot be restricted to non-stateful types; it does not need to be, because the highest matching severity wins (an ingress-widening create is still high). No default rule sets `verdict: block`.
+
+### Rules file format
+
+`when` fields (every field present must match; at least one is required):
+- `type_matches`: list of type names; `*` matches any run of characters.
+- `action_in`: list of `no-op`, `create`, `read`, `update`, `delete`, `replace`, `forget`. `unknown` is not selectable: Unknown actions are always needs-attention.
+- `address_matches`: list of address globs. Only `*` is special; brackets are literal, so `aws_instance.web[*]` works as written.
 - `predicate`: name of a registered Go predicate.
 
 Rule fields: `id` (unique), `severity` (`high` | `medium` | `low`), `meaning`, and optional `verdict: block`. The `meaning` text explains the risk in plain language. It is shown in output and later passed to the LLM layer.
+
+The loader rejects unknown fields, a `version` other than 1, missing or duplicate ids, invalid severities, actions or verdicts, empty lists, an empty `when`, and unknown predicate names. All problems in a file are reported together.
 
 ### Predicates
 
@@ -217,25 +239,43 @@ Rule fields: `id` (unique), `severity` (`high` | `medium` | `low`), `meaning`, a
 type Predicate func(c plan.Change) (matched bool, detail string)
 ```
 
-Initial registry:
-- **`widens_network_access`:** for update and replace, true when the set of allowed (source, port range) pairs after the change is not contained in the set before. For create (no `before`), true when any ingress allows a source outside RFC 1918 / ULA private space, including `0.0.0.0/0` and `::/0`.
-- **`disables_encryption`**
-- **`removes_deletion_protection`**
-- **`reduces_backup_retention`**
-- **`changes_sensitive_attribute`:** uses the marker walker from section 4.
+Predicates live in `internal/predicates` and are registered by name in `predicates.Registry()`.
+
+**Reading values.** Predicates read attribute values only through `plan.Change.RawBefore(path)` and `RawAfter(path)`, which return `(value, ok)`. `ok` is false when:
+- the path is absent on that side;
+- the path is sensitive on **either** side (matching the diff's masking), or is a container with any sensitive descendant, so a secret cannot be read by asking for its parent block;
+- for `RawAfter`, the value or any part of it is unknown until apply.
+
+Structure that is not secret (which paths exist, which changed, which are sensitive, unknown or null) comes from `Change.Diff()`. `DiffEntry.BeforeNull` / `AfterNull` report a present null value, including on sensitive paths, since whether a value exists is not itself secret.
+
+**Detail strings** name paths and, where useful, non-sensitive numbers, booleans, protocols, ports and CIDRs. They never contain a value that could be secret.
+
+**Transitions.** Unless stated otherwise, a predicate only looks at paths whose value changed, and both sides must be readable. A value that is unknown after never matches a transition. Attributes are matched by their last path segment wherever they appear, so nested blocks (`ebs_block_device.0.encrypted`) are covered. Boolean attributes accept JSON booleans and the strings `"true"` / `"false"`, which some provider attributes use.
+
+Registry:
+- **`widens_network_access`:** covers `aws_security_group` (`ingress` blocks), `aws_security_group_rule` (`type = "ingress"` only) and `aws_vpc_security_group_ingress_rule`. A permission is a (protocol, port range, source) triple; the source is a CIDR, a security group, a prefix list or `self`.
+  - **Update and replace:** true when some permission after the change is not covered by a permission before. Coverage requires the same protocol (or all protocols before), a containing port range, and a containing source: a CIDR that contains the new CIDR, the same group, prefix list or self, or `0.0.0.0/0` / `::/0` of the same family (these also cover group, prefix-list and self sources).
+  - **Create:** true when any ingress allows a CIDR outside RFC 1918 / ULA private space (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), including `0.0.0.0/0` and `::/0`. Group, prefix-list and self sources are not public.
+  - **Unknown values:** a source that is unknown until apply cannot be shown to be covered or private. An unknown CIDR counts as widening. An unknown security group is not public on create, but on update it is a new source. A whole `ingress` attribute or block that is unknown counts as all traffic from an unknown source.
+  - **Normalisation:** protocol names and numbers are equated (`-1`/`all`, `6`/`tcp`, `17`/`udp`, `1`/`icmp`, `58`/`icmpv6`), CIDRs are masked, and ports are ignored for all-protocol rules.
+  - **Detail:** lists each new permission, e.g. `new ingress: ingress.0: tcp port 22 from 0.0.0.0/0`.
+- **`disables_encryption`:** true when `storage_encrypted` (RDS), `encrypted` (EBS, EFS), `at_rest_encryption_enabled` or `transit_encryption_enabled` (ElastiCache) goes true to false, or when `kms_key_id`, `kms_key_arn` or `kms_master_key_id` goes from non-empty to empty, null or removed (its block deleted). It also matches when a customer-managed key is replaced by an AWS-managed key (`alias/aws/rds` or any other `alias/aws/*`, as an alias name or alias ARN): a key is still set, but the resource stops using its own. That detail names only the alias, never an ARN's account or region. A key replaced by another customer-managed key, or one AWS-managed alias replaced by another, does not match. `point_in_time_recovery` is not encryption. Detail names the path.
+- **`removes_deletion_protection`:** true when `deletion_protection` or `deletion_protection_enabled` (RDS, DynamoDB) or `enable_deletion_protection` (load balancers) goes true to false, or `force_destroy` (S3, ECR and others using that convention) goes false to true. The rule is medium: this is a precursor to damage, not damage.
+- **`reduces_backup_retention`:** true when `backup_retention_period` or `snapshot_retention_limit` decreases numerically, when `skip_final_snapshot` or `delete_automated_backups` goes false to true, or when `point_in_time_recovery.N.enabled` goes true to false. A decrease to 0 is marked `(backups disabled)` in the detail. It is deliberately not a separate predicate or a separate high rule: the rule stays medium, and the detail tells the reviewer.
+- **`changes_sensitive_attribute`:** uses sensitivity markers only and never reads values. Always false for data sources, and for actions other than update and replace.
   - **Update:** true when any changed path in the flattened diff is marked sensitive in `AfterSensitive` or `BeforeSensitive`.
-  - **Replace:** true when any path is marked sensitive in `AfterSensitive` with a non-null `after` value, whether or not it changed, because a replace rewrites every attribute. This is how a forced replace resets a manually rotated password to the placeholder held in state.
+  - **Replace:** true when any path is marked sensitive in `AfterSensitive` with a non-null `after` value, whether or not it changed, because a replace rewrites every attribute. This is how a forced replace resets a manually rotated password to the placeholder held in state. A sensitive value that is unknown until apply counts as non-null, since a value will be written.
   - **Write-only attributes:** for update and replace, also true when any changed path's last segment ends in `_wo_version`, with detail `<path> changed (write-only value will be rewritten)`. Write-only attributes (`*_wo`, Terraform 1.11+) are detected through this companion attribute, since the value itself is null in plan JSON.
   - **Detail string:** lists the sensitive paths by path only, never by value.
-- **`was_moved`:** true when `PreviousAddress` is set. Used by the default `moved-then-replaced` rule (`action_in: [replace]`, severity high): the author used `moved` to keep the resource, and the plan destroys it anyway.
+- **`was_moved`:** true when `PreviousAddress` is set, with detail `moved from <address>`. Used by the default `moved-then-replaced` rule (`action_in: [replace]`, severity high): the author used `moved` to keep the resource, and the plan destroys it anyway. Also used by the low-severity `moved` rule for pure moves.
 
 An unknown predicate name in the rules file is a load-time error (exit 4).
 
 ### Evaluation
 
-- **Matching:** all rules are evaluated. A change takes the highest severity among the rules that match it, and every matching rule id and predicate detail is recorded.
-- **Unmatched changes:** a change no rule matches is recorded with `matched: false` and rendered with a distinct "no rule matched" marker. Its verdict comes from the `unmatched` block: destructive actions (delete, replace) default to `needs-attention`, everything else to `approve`. Ordinary updates on uncovered types therefore don't make every plan exit 1, while a delete or replace on an uncovered type still gets attention. Unmatched changes have no severity and sort after matched changes with the same verdict.
-- **Rules in YAML, not code:** a catch-all low-severity rule (create-only on non-stateful types) and a medium rule for `forget` (the resource leaves Terraform management) go in the default YAML. They are not hard-coded.
+- **Matching:** all rules are evaluated against every change. A change takes the highest severity among the rules that match it, and every matching rule id and predicate detail is recorded, in rules-file order.
+- **Exclusions:** data sources are never reviewed. No-op changes are excluded unless a rule matches them, which is how the `moved` rule reports pure moves. Every other change is kept, including unmatched changes and Unknown actions.
+- **Unmatched changes:** a change no rule matches is recorded with `matched: false` and rendered with a distinct "no rule matched" marker. Its verdict comes from the `unmatched` block: destructive actions (delete, replace) default to `needs-attention`, everything else to `approve`. Ordinary updates on uncovered types therefore don't make every plan exit 1, while a delete or replace on an uncovered type still gets attention. Unmatched changes have no severity and sort after matched changes with the same verdict. Verdicts are applied by `internal/review` (section 7).
 
 ## 6. Blast radius (`internal/graph`) — planned
 
@@ -389,10 +429,24 @@ The provider is selected with `--provider`. Users are responsible for making sur
 
 - **Never commit real plans.** Do not commit plan JSON generated from real infrastructure, even with values edited out. Build test plans with `internal/planfix`, or generate them locally from throwaway configurations.
 - **`internal/planfix`:** builds plan JSON programmatically, including actions, before/after values, sensitivity markers, prior-state dependencies (`DependsOn`, `PriorResource`), module nesting and moved resources (`MovedFrom`). It does not import `internal/plan`, so parser tests cross the real JSON boundary. `prior_state` is emitted only when some resource existed before, which matches Terraform's behaviour on a first plan.
-- **Sensitivity leaks:** every sensitivity test asserts that no rendered or formatted diff entry contains the secret value.
-- **Predicates:** every predicate gets table tests.
-  - `widens_network_access` covers CIDR containment, port ranges, rule addition and removal, creates with no `before`, IPv6, and rules that use a security group as the source.
+- **Sensitivity leaks:** fixture secrets contain the marker `SECRET`, so leak checks can search for it.
+  - Every sensitivity test asserts that no rendered or formatted diff entry contains a secret.
+  - `RawBefore` / `RawAfter` tests assert `ok=false` for every path the diff marks sensitive, including parents of sensitive leaves and root-literal sensitivity.
+  - Every predicate test case, and the classify tests, assert that no detail string contains a secret.
+- **Rules:** tests cover the embedded default set (every rule id and severity, no default `block`), each load-time error, reporting several errors at once, selector matching, and the glob matcher (including literal brackets in addresses).
+- **Predicates:** every predicate gets table tests, run through `planfix` and `plan.Parse`.
+  - `widens_network_access` covers:
+    - CIDR containment, including unmasked CIDRs and coverage by a second rule;
+    - port ranges, protocol names versus numbers, and all-protocol rules;
+    - rule addition, removal and reordering;
+    - creates with no `before`, including CIDRs that straddle private space;
+    - IPv6, including `::/0` not being covered by `0.0.0.0/0`;
+    - security groups, prefix lists and `self` as sources;
+    - unknown sources and unknown `ingress`;
+    - all three resource types, including egress rules being ignored.
+  - `disables_encryption`, `removes_deletion_protection` and `reduces_backup_retention` cover each listed attribute, the reverse transition (no match), nested blocks, unknown after values (no match), sensitive values (never read), and for KMS keys: removal, emptying, block deletion, customer key to AWS-managed alias (name and ARN, with the detail omitting account and region), and key rotation or alias-to-alias changes (no match).
   - `changes_sensitive_attribute`: the cases and expected results are in the table below.
+- **Classification:** a mixed plan through the default rules checks highest-severity selection, that every match is recorded in order, the no-op and data-source exclusions, the pure-move exception, and that unmatched and Unknown changes are kept.
 - **Renderers:** golden-file tests for all three; `go test -update` regenerates them.
 - **Real plans as sanity checks:** plan JSON generated locally with Terraform 1.15.x checks the parser against real output.
   - Built-in `terraform_data` resources need no provider or credentials, and cover create, replace, `moved`, `forget`, `depends_on` and first-plan cases.
@@ -417,6 +471,8 @@ The provider is selected with `--provider`. Users are responsible for making sur
 | Data-source change (excluded upstream, but the predicate may still be called) | no match |
 | `password_wo_version` changed on update | match; detail names the `_wo_version` path |
 | `password_wo_version` unchanged on update, other non-sensitive paths changed | no match |
+| Replace where the sensitive value is unknown until apply | match |
+| Create (no existing secret to overwrite) | no match |
 | Any case | no detail string contains a sensitive value |
 
 Before sending a change, run:
@@ -429,7 +485,7 @@ go test ./...
 ## 10. Roadmap
 
 1. **Done:** plan parsing, fixture builder, CLI skeleton with input and errored-plan handling.
-2. `internal/rules`, `internal/classify`, first predicates (`changes_sensitive_attribute` first, since it builds directly on `Diff()` and `Marked`), and the default rules YAML with the `unmatched` block.
+2. **Done:** `internal/rules`, `internal/predicates`, `internal/classify`, the default rules YAML with the `unmatched` block, and `--rules`.
 3. `internal/graph`, `internal/review`, the three renderers, and the full set of exit codes. This is the first usable release. `planfix` gains `configuration` support (module calls, expression references) for the graph.
 4. Eval cases and runner for the deterministic review.
 5. Optional LLM layer: `internal/intent`, `internal/redact`, `internal/llm` (Bedrock and Anthropic), `internal/agent`, and the deterministic-versus-LLM eval comparison.

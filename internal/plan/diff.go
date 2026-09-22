@@ -35,6 +35,10 @@ type DiffEntry struct {
 	Unknown         bool // After is unknown until apply
 	BeforeSensitive bool
 	AfterSensitive  bool
+
+	// BeforeNull and AfterNull report a present null value. They are set
+	// for sensitive paths too: whether a value exists is not itself secret.
+	BeforeNull, AfterNull bool
 }
 
 // Sensitive reports whether either side of the entry is sensitive.
@@ -71,6 +75,7 @@ func (c Change) Diff() []DiffEntry {
 	for _, l := range before {
 		e := get(l)
 		e.Before = render(l)
+		e.BeforeNull = l.raw == nil && !l.unknown
 		e.BeforeSensitive = l.sensitive
 		beforeRaw[pathKey(l.segs)] = l
 	}
@@ -80,6 +85,7 @@ func (c Change) Diff() []DiffEntry {
 		seenAfter[k] = true
 		e := get(l)
 		e.After = render(l)
+		e.AfterNull = l.raw == nil && !l.unknown
 		e.AfterSensitive = l.sensitive
 		e.Unknown = l.unknown
 		b, ok := beforeRaw[k]

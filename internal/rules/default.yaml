@@ -1,0 +1,108 @@
+# Default tfreview rules. Override with --rules <file>.
+#
+# A change takes the highest severity among the rules it matches.
+# high and medium are needs-attention, low is approve. `verdict: block`
+# on a rule blocks; no default rule does.
+version: 1
+
+unmatched:
+  destructive: needs-attention   # delete, replace
+  other: approve                 # create, update, forget
+  # Unknown actions are always needs-attention and are not configurable here.
+
+rules:
+  - id: stateful-destroy
+    when:
+      type_matches: [aws_db_instance, aws_rds_cluster, aws_dynamodb_table,
+                     aws_s3_bucket, aws_ebs_volume, aws_efs_file_system,
+                     aws_elasticache_*, aws_route53_zone]
+      action_in: [delete, replace]
+    severity: high
+    meaning: >
+      Destroys stored data unless a final snapshot or backup is configured.
+      Recovery requires restore from backup.
+
+  - id: sg-ingress-widened
+    when:
+      type_matches: [aws_security_group, aws_security_group_rule,
+                     aws_vpc_security_group_ingress_rule]
+      action_in: [create, update, replace]
+      predicate: widens_network_access
+    severity: high
+    meaning: >
+      Allows traffic from sources that could not reach this resource before.
+
+  - id: encryption-disabled
+    when:
+      action_in: [update, replace]
+      predicate: disables_encryption
+    severity: high
+    meaning: >
+      Turns off encryption or removes the customer-managed KMS key. Data
+      written afterwards is stored unencrypted or under a different key, and
+      for many resources this also forces a replace.
+
+  - id: deletion-protection-removed
+    when:
+      action_in: [update, replace]
+      predicate: removes_deletion_protection
+    severity: medium
+    meaning: >
+      Removes a safeguard against deletion. Nothing is destroyed by this
+      change, but a later delete or replace will no longer be stopped.
+
+  - id: backup-retention-reduced
+    when:
+      action_in: [update, replace]
+      predicate: reduces_backup_retention
+    severity: medium
+    meaning: >
+      Reduces how far back data can be recovered, or skips the final
+      snapshot or backups on deletion. Existing backups outside the new
+      retention window are deleted. A retention of 0 disables automated
+      backups entirely.
+
+  - id: sensitive-attribute-changed
+    when:
+      action_in: [update, replace]
+      predicate: changes_sensitive_attribute
+    severity: medium
+    meaning: >
+      A sensitive value is being written. If this value was set manually
+      after the initial apply, this change will overwrite it. For values
+      the provider cannot read back, state still holds the original
+      placeholder, so a replace resets the live secret to it.
+
+  - id: moved-then-replaced
+    when:
+      action_in: [replace]
+      predicate: was_moved
+    severity: high
+    meaning: >
+      A moved block was meant to keep this resource, but the plan destroys
+      and recreates it anyway, usually because an attribute that forces
+      replacement also changed.
+
+  - id: moved
+    when:
+      action_in: [no-op]
+      predicate: was_moved
+    severity: low
+    meaning: >
+      The resource's address changes through a moved block. No
+      infrastructure changes.
+
+  - id: removed-from-state
+    when:
+      action_in: [forget]
+    severity: medium
+    meaning: >
+      Terraform stops managing this resource. It keeps running, but later
+      changes to it will not be tracked, and nothing will destroy it.
+
+  - id: new-resource
+    when:
+      action_in: [create]
+    severity: low
+    meaning: >
+      Creates a new resource. Nothing existing is changed.
