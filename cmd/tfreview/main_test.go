@@ -61,13 +61,87 @@ func TestPlanFileListsChanges(t *testing.T) {
 	if code != exitApprove {
 		t.Errorf("exit = %d, want %d (stderr %q)", code, exitApprove, stderr)
 	}
+	rows := tableRows(stdout)
+	for addr, want := range map[string][]string{
+		"aws_db_instance.main": {"replace", "high", "stateful-destroy", "replace_because_cannot_update"},
+		"aws_s3_bucket.logs":   {"unknown(create,update)", "unmatched", "-", "-"},
+	} {
+		if got := rows[addr]; strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Errorf("row %s = %v, want %v", addr, got, want)
+		}
+	}
+	if !strings.Contains(stdout, "WARNING: aws_s3_bucket.logs: unrecognised actions") {
+		t.Errorf("missing unknown-action warning:\n%s", stdout)
+	}
+}
+
+// tableRows maps each table row's address to its remaining columns.
+func tableRows(out string) map[string][]string {
+	rows := map[string][]string{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 5 && f[0] != "ADDRESS" {
+			rows[f[0]] = f[1:]
+		}
+	}
+	return rows
+}
+
+func TestDetailsAndExclusions(t *testing.T) {
+	fix := planfix.New()
+	fix.Resource("aws_db_instance.main", "update").
+		Before(map[string]any{"backup_retention_period": 7}).
+		After(map[string]any{"backup_retention_period": 0})
+	fix.Resource("data.aws_ami.u", "read")
+	fix.Resource("aws_instance.same", "no-op").Before(map[string]any{}).After(map[string]any{})
+
+	code, stdout, stderr := runCLI(t, nil, fix.String())
+	if code != exitApprove {
+		t.Fatalf("exit = %d, stderr %q", code, stderr)
+	}
+	if got := tableRows(stdout)["aws_db_instance.main"]; len(got) < 2 || got[1] != "medium" {
+		t.Errorf("row = %v, want medium", got)
+	}
 	for _, want := range []string{
-		"aws_db_instance.main  replace                 replace_because_cannot_update",
-		"aws_s3_bucket.logs    unknown(create,update)  -",
-		"WARNING: aws_s3_bucket.logs: unrecognised actions",
+		"aws_db_instance.main [backup-retention-reduced] backup_retention_period: 7 -> 0 (backups disabled)",
+		"2 change(s) not shown",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+	if _, ok := tableRows(stdout)["aws_instance.same"]; ok {
+		t.Error("no-op change without a matching rule should not be listed")
+	}
+}
+
+func TestRulesFlag(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	custom := write("ok.yaml", "version: 1\nrules:\n  - id: any-create\n    when: {action_in: [create]}\n    severity: high\n")
+	bad := write("bad.yaml", "version: 1\nrules:\n  - id: x\n    when: {predicate: no_such_thing}\n    severity: high\n")
+
+	fix := planfix.New()
+	fix.Resource("terraform_data.a")
+
+	code, stdout, _ := runCLI(t, []string{"--rules", custom}, fix.String())
+	if code != exitApprove || tableRows(stdout)["terraform_data.a"][1] != "high" {
+		t.Errorf("custom rules: exit %d\n%s", code, stdout)
+	}
+
+	for _, tt := range []struct{ path, want string }{
+		{bad, `unknown predicate "no_such_thing"`},
+		{filepath.Join(dir, "missing.yaml"), "no such file"},
+	} {
+		code, _, stderr := runCLI(t, []string{"--rules", tt.path}, fix.String())
+		if code != exitConfigError || !strings.Contains(stderr, tt.want) {
+			t.Errorf("--rules %s: exit %d stderr %q; want %d containing %q", tt.path, code, stderr, exitConfigError, tt.want)
 		}
 	}
 }
