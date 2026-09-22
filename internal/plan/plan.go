@@ -100,6 +100,11 @@ func Parse(r io.Reader) (*Plan, error) {
 	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("invalid plan JSON: %w", err)
 	}
+	// Decode stops after one value; anything after it (a second document,
+	// log lines from a wrapper) means the input is not a single plan.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("invalid plan JSON: unexpected data after the plan document")
+	}
 	if err := checkFormatVersion(raw.FormatVersion); err != nil {
 		return nil, err
 	}

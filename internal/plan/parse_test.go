@@ -36,6 +36,19 @@ func TestParseInvalid(t *testing.T) {
 	}
 }
 
+func TestParseTrailingData(t *testing.T) {
+	doc := planfix.New().String()
+	for _, in := range []string{doc + doc, doc + "\nlog: done\n", doc + "}", doc + " 1"} {
+		_, err := plan.Parse(strings.NewReader(in))
+		if err == nil || !strings.Contains(err.Error(), "unexpected data after the plan document") {
+			t.Errorf("Parse(plan + %q) error = %v, want trailing data error", in[len(doc):], err)
+		}
+	}
+	if _, err := plan.Parse(strings.NewReader(doc + "\n \t\n")); err != nil {
+		t.Errorf("trailing whitespace should be accepted: %v", err)
+	}
+}
+
 func TestParseFormatVersion(t *testing.T) {
 	tests := []struct {
 		version string
